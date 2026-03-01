@@ -1,0 +1,404 @@
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from app.models.survey import Survey, Question, Option, SurveyStatus, QuestionType
+from app.models.answer import Response, Answer
+from app.extensions import db
+
+surveys_bp = Blueprint('surveys', __name__, url_prefix='/api/surveys')
+
+
+@surveys_bp.route('', methods=['POST'])
+@jwt_required()
+def create_survey():
+    """Создать новый опрос (черновик)"""
+    data = request.get_json()
+    
+    if not data.get('title'):
+        return jsonify({'error': 'Title is required'}), 400
+    
+    author_id = get_jwt_identity()
+    
+    survey = Survey(
+        title=data['title'],
+        description=data.get('description', ''),
+        author_id=author_id,
+        status=SurveyStatus.DRAFT
+    )
+    
+    db.session.add(survey)
+    db.session.commit()
+    
+    return jsonify(survey.to_dict()), 201
+
+
+@surveys_bp.route('', methods=['GET'])
+@jwt_required()
+def list_surveys():
+    """Получить список опросов автора"""
+    author_id = get_jwt_identity()
+    surveys = Survey.query.filter_by(author_id=author_id).all()
+    return jsonify([s.to_dict() for s in surveys]), 200
+
+
+@surveys_bp.route('/<int:survey_id>', methods=['GET'])
+def get_survey(survey_id):
+    """Получить опрос для прохождения (публичный эндпоинт)"""
+    survey = Survey.query.get_or_404(survey_id)
+    
+    # Можно проходить только опубликованные опросы
+    if survey.status != SurveyStatus.PUBLISHED:
+        # Автор может видеть свой черновик
+        current_user_id = get_jwt_identity(optional=True)
+        if survey.author_id != current_user_id:
+            return jsonify({'error': 'Survey not published'}), 403
+    
+    return jsonify(survey.to_dict(include_questions=True)), 200
+
+
+@surveys_bp.route('/<int:survey_id>', methods=['PUT'])
+@jwt_required()
+def update_survey(survey_id):
+    """Редактировать опрос (только черновик)"""
+    author_id = get_jwt_identity()
+    survey = Survey.query.get_or_404(survey_id)
+    
+    # Проверка прав
+    if survey.author_id != author_id:
+        return jsonify({'error': 'Forbidden'}), 403
+    
+    # Редактировать можно только черновик
+    if survey.status != SurveyStatus.DRAFT:
+        return jsonify({'error': 'Cannot edit published or closed survey'}), 400
+    
+    data = request.get_json()
+    
+    if 'title' in data:
+        survey.title = data['title']
+    if 'description' in data:
+        survey.description = data['description']
+    
+    db.session.commit()
+    return jsonify(survey.to_dict()), 200
+
+
+@surveys_bp.route('/<int:survey_id>', methods=['DELETE'])
+@jwt_required()
+def delete_survey(survey_id):
+    """Удалить опрос (только автор, только черновик)"""
+    author_id = get_jwt_identity()
+    survey = Survey.query.get_or_404(survey_id)
+    
+    if survey.author_id != author_id:
+        return jsonify({'error': 'Forbidden'}), 403
+    
+    if survey.status != SurveyStatus.DRAFT:
+        return jsonify({'error': 'Cannot delete published survey'}), 400
+    
+    db.session.delete(survey)
+    db.session.commit()
+    return jsonify({'message': 'Survey deleted'}), 200
+
+
+@surveys_bp.route('/<int:survey_id>/questions', methods=['POST'])
+@jwt_required()
+def add_question(survey_id):
+    """Добавить вопрос к опросу"""
+    author_id = get_jwt_identity()
+    survey = Survey.query.get_or_404(survey_id)
+    
+    # Проверка прав и статуса
+    if survey.author_id != author_id or survey.status != SurveyStatus.DRAFT:
+        return jsonify({'error': 'Forbidden or survey not in draft'}), 403
+    
+    data = request.get_json()
+    
+    # Валидация обязательных полей
+    if not data.get('text') or not data.get('type'):
+        return jsonify({'error': 'Text and type are required'}), 400
+    
+    q_type_str = data['type']  # 'single', 'multiple', 'text'
+    
+    # Проверка типа вопроса
+    if q_type_str not in [t.value for t in QuestionType]:
+        return jsonify({'error': f'Invalid question type: {q_type_str}'}), 400
+    
+    # Валидация: текстовый вопрос не может иметь вариантов
+    if q_type_str == QuestionType.TEXT.value and data.get('options'):
+        return jsonify({'error': 'Text questions cannot have options'}), 400
+    
+    # Валидация: вопросы с выбором должны иметь варианты
+    if q_type_str in [QuestionType.SINGLE.value, QuestionType.MULTIPLE.value]:
+        if not data.get('options') or not isinstance(data['options'], list) or len(data['options']) < 2:
+            return jsonify({'error': 'Choice questions need at least 2 options'}), 400
+    
+    # Создаём вопрос
+    question = Question(
+        survey_id=survey.id,
+        text=data['text'],
+        q_type=QuestionType(q_type_str),  # Конвертируем строку в Enum
+        order=data.get('order', 0)
+    )
+    
+    db.session.add(question)
+    db.session.flush()  # Получаем ID вопроса
+    
+    # Добавляем варианты ответов (если есть)
+    if data.get('options'):
+        for opt_text in data['options']:
+            if opt_text:  # Пропускаем пустые
+                option = Option(question_id=question.id, text=opt_text.strip())
+                db.session.add(option)
+    
+    db.session.commit()
+    return jsonify(question.to_dict()), 201
+
+
+@surveys_bp.route('/<int:survey_id>/questions/<int:question_id>', methods=['PUT'])
+@jwt_required()
+def update_question(survey_id, question_id):
+    """Редактировать вопрос (только черновик)"""
+    author_id = get_jwt_identity()
+    survey = Survey.query.get_or_404(survey_id)
+    
+    if survey.author_id != author_id or survey.status != SurveyStatus.DRAFT:
+        return jsonify({'error': 'Forbidden or survey not in draft'}), 403
+    
+    question = Question.query.get_or_404(question_id)
+    if question.survey_id != survey.id:
+        return jsonify({'error': 'Question does not belong to this survey'}), 400
+    
+    data = request.get_json()
+    
+    if 'text' in data:
+        question.text = data['text']
+    if 'order' in data:
+        question.order = data['order']
+    
+    db.session.commit()
+    return jsonify(question.to_dict()), 200
+
+
+@surveys_bp.route('/<int:survey_id>/questions/<int:question_id>', methods=['DELETE'])
+@jwt_required()
+def delete_question(survey_id, question_id):
+    """Удалить вопрос (только черновик)"""
+    author_id = get_jwt_identity()
+    survey = Survey.query.get_or_404(survey_id)
+    
+    if survey.author_id != author_id or survey.status != SurveyStatus.DRAFT:
+        return jsonify({'error': 'Forbidden or survey not in draft'}), 403
+    
+    question = Question.query.get_or_404(question_id)
+    if question.survey_id != survey.id:
+        return jsonify({'error': 'Question does not belong to this survey'}), 400
+    
+    db.session.delete(question)
+    db.session.commit()
+    return jsonify({'message': 'Question deleted'}), 200
+
+
+@surveys_bp.route('/<int:survey_id>/publish', methods=['POST'])
+@jwt_required()
+def publish_survey(survey_id):
+    """Опубликовать опрос"""
+    author_id = get_jwt_identity()
+    survey = Survey.query.get_or_404(survey_id)
+    
+    if survey.author_id != author_id:
+        return jsonify({'error': 'Forbidden'}), 403
+    
+    if survey.status != SurveyStatus.DRAFT:
+        return jsonify({'error': 'Survey must be in draft to publish'}), 400
+    
+    # Проверка: есть ли вопросы
+    if not survey.questions:
+        return jsonify({'error': 'Survey must have at least one question'}), 400
+    
+    survey.status = SurveyStatus.PUBLISHED
+    db.session.commit()
+    
+    return jsonify({'message': 'Survey published', 'survey': survey.to_dict()}), 200
+
+
+@surveys_bp.route('/<int:survey_id>/close', methods=['POST'])
+@jwt_required()
+def close_survey(survey_id):
+    """Закрыть опрос"""
+    author_id = get_jwt_identity()
+    survey = Survey.query.get_or_404(survey_id)
+    
+    if survey.author_id != author_id:
+        return jsonify({'error': 'Forbidden'}), 403
+    
+    if survey.status != SurveyStatus.PUBLISHED:
+        return jsonify({'error': 'Only published surveys can be closed'}), 400
+    
+    survey.status = SurveyStatus.CLOSED
+    db.session.commit()
+    
+    return jsonify({'message': 'Survey closed'}), 200
+
+
+@surveys_bp.route('/<int:survey_id>/submit', methods=['POST'])
+@jwt_required()
+def submit_response(survey_id):
+    """Пройти опрос и отправить ответы"""
+    user_id = get_jwt_identity()
+    survey = Survey.query.get_or_404(survey_id)
+    
+    # Можно проходить только опубликованные опросы
+    if survey.status != SurveyStatus.PUBLISHED:
+        return jsonify({'error': 'Survey is not active'}), 400
+    
+    # Проверка: не проходил ли уже этот пользователь
+    if Response.query.filter_by(survey_id=survey.id, user_id=user_id).first():
+        return jsonify({'error': 'You have already responded to this survey'}), 400
+    
+    data = request.get_json()
+    answers_data = data.get('answers', [])
+    
+    if not answers_data:
+        return jsonify({'error': 'No answers provided'}), 400
+    
+    # Создаём запись о прохождении
+    response = Response(survey_id=survey.id, user_id=user_id)
+    db.session.add(response)
+    db.session.flush()  # Получаем ID response
+    
+    # Обрабатываем каждый ответ
+    for ans_data in answers_data:
+        question_id = ans_data.get('question_id')
+        if not question_id:
+            continue
+        
+        question = Question.query.get(question_id)
+        if not question or question.survey_id != survey.id:
+            continue  # Пропускаем неверные вопросы
+        
+        answer = Answer(
+            response_id=response.id,
+            question_id=question.id
+        )
+        
+        if question.q_type == QuestionType.TEXT:
+            # Текстовый ответ
+            answer.text_value = ans_data.get('value', '').strip()
+        else:
+            # Ответ с выбором (сохраняем ID варианта)
+            option_id = ans_data.get('option_id')
+            if option_id:
+                # Валидация: вариант должен принадлежать этому вопросу
+                option = Option.query.get(option_id)
+                if option and option.question_id == question.id:
+                    answer.option_id = option_id
+        
+        db.session.add(answer)
+    
+    db.session.commit()
+    
+    return jsonify({'message': 'Response submitted', 'response_id': response.id}), 201
+
+
+@surveys_bp.route('/<int:survey_id>/results', methods=['GET'])
+@jwt_required()
+def get_results(survey_id):
+    """Получить аналитику по опросу (только автор)"""
+    author_id = get_jwt_identity()
+    survey = Survey.query.get_or_404(survey_id)
+    
+    if survey.author_id != author_id:
+        return jsonify({'error': 'Forbidden'}), 403
+    
+    # Количество респондентов
+    total_responses = Response.query.filter_by(survey_id=survey.id).count()
+    
+    results = {
+        'survey_id': survey.id,
+        'total_responses': total_responses,
+        'questions': []
+    }
+    
+    for question in survey.questions:
+        q_result = {
+            'question_id': question.id,
+            'text': question.text,
+            'type': question.q_type.value
+        }
+        
+        if question.q_type == QuestionType.TEXT:
+            # Текстовые ответы: список значений
+            text_answers = db.session.query(Answer.text_value)\
+                .join(Response)\
+                .filter(
+                    Answer.question_id == question.id,
+                    Response.survey_id == survey.id,
+                    Answer.text_value != None
+                ).all()
+            q_result['answers'] = [a[0] for a in text_answers if a[0]]
+        else:
+            # Вопросы с выбором: статистика по вариантам
+            options_stats = []
+            for option in question.options:
+                count = db.session.query(Answer)\
+                    .join(Response)\
+                    .filter(
+                        Answer.option_id == option.id,
+                        Response.survey_id == survey.id
+                    ).count()
+                
+                percent = (count / total_responses * 100) if total_responses > 0 else 0
+                options_stats.append({
+                    'option_id': option.id,
+                    'text': option.text,
+                    'count': count,
+                    'percentage': round(percent, 2)
+                })
+            q_result['options'] = options_stats
+        
+        results['questions'].append(q_result)
+    
+    return jsonify(results), 200
+
+
+@surveys_bp.route('/<int:survey_id>/results/export', methods=['GET'])
+@jwt_required()
+def export_results(survey_id):
+    """Экспорт результатов в JSON"""
+    author_id = get_jwt_identity()
+    survey = Survey.query.get_or_404(survey_id)
+    
+    if survey.author_id != author_id:
+        return jsonify({'error': 'Forbidden'}), 403
+    
+    # Получаем все ответы с данными
+    responses = Response.query.filter_by(survey_id=survey.id).all()
+    
+    export_data = {
+        'survey': survey.to_dict(),
+        'responses': []
+    }
+    
+    for resp in responses:
+        resp_data = {
+            'user_id': resp.user_id,
+            'submitted_at': resp.submitted_at.isoformat() if resp.submitted_at else None,
+            'answers': []
+        }
+        
+        for answer in resp.answers:
+            ans_data = {
+                'question_id': answer.question_id,
+                'question_text': answer.question.text if answer.question else None,
+                'question_type': answer.question.q_type.value if answer.question else None
+            }
+            
+            if answer.question and answer.question.q_type == QuestionType.TEXT:
+                ans_data['value'] = answer.text_value
+            elif answer.option:
+                ans_data['value'] = answer.option.text
+            
+            resp_data['answers'].append(ans_data)
+        
+        export_data['responses'].append(resp_data)
+    
+    return jsonify(export_data), 200
