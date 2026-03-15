@@ -34,10 +34,56 @@ def create_survey():
 @surveys_bp.route('', methods=['GET'])
 @jwt_required()
 def list_surveys():
-    """Получить список опросов автора"""
+    """Получить список опросов с фильтрацией, сортировкой и пагинацией"""
     author_id = get_jwt_identity()
-    surveys = Survey.query.filter_by(author_id=author_id).all()
-    return jsonify([s.to_dict() for s in surveys]), 200
+    
+    # === ФИЛЬТРЫ ===
+    query = Survey.query.filter_by(author_id=author_id)
+    
+    # Фильтр по статусу: mine (все), active (опубликованные), completed (закрытые)
+    status_filter = request.args.get('status', 'mine')
+    if status_filter == 'active':
+        query = query.filter_by(status=SurveyStatus.PUBLISHED)
+    elif status_filter == 'completed':
+        query = query.filter_by(status=SurveyStatus.CLOSED)
+    # 'mine' или другое значение → все опросы автора
+    
+    # === СОРТИРОВКА ===
+    sort_by = request.args.get('sort', 'created_desc')
+    if sort_by == 'created_asc':
+        query = query.order_by(Survey.created_at.asc())
+    elif sort_by == 'answers_desc':
+        # Сортировка по количеству ответов (подзапрос)
+        from sqlalchemy import func
+        query = query.outerjoin(Response).group_by(Survey.id)\
+                     .order_by(func.count(Response.id).desc(), Survey.created_at.desc())
+    else:  # created_desc (по умолчанию)
+        query = query.order_by(Survey.created_at.desc())
+    
+    # === ПАГИНАЦИЯ ===
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 10, type=int)
+    per_page = min(per_page, 50)  # Лимит на страницу
+    
+    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
+    
+    # Формируем ответ
+    surveys_data = []
+    for survey in pagination.items:
+        s_dict = survey.to_dict()
+        # Добавляем счетчик ответов для каждого опроса
+        s_dict['responses_count'] = Response.query.filter_by(survey_id=survey.id).count()
+        surveys_data.append(s_dict)
+    
+    return jsonify({
+        'surveys': surveys_data,
+        'pagination': {
+            'page': pagination.page,
+            'per_page': pagination.per_page,
+            'total': pagination.total,
+            'pages': pagination.pages
+        }
+    }), 200
 
 
 @surveys_bp.route('/<int:survey_id>', methods=['GET'])
@@ -242,15 +288,15 @@ def close_survey(survey_id):
 @surveys_bp.route('/<int:survey_id>/submit', methods=['POST'])
 @jwt_required()
 def submit_response(survey_id):
-    """Пройти опрос и отправить ответы"""
+    """Пройти опрос и отправить ответы с полной валидацией"""
     user_id = get_jwt_identity()
     survey = Survey.query.get_or_404(survey_id)
     
-    # Можно проходить только опубликованные опросы
+    # 1. Можно проходить только опубликованные опросы
     if survey.status != SurveyStatus.PUBLISHED:
         return jsonify({'error': 'Survey is not active'}), 400
     
-    # Проверка: не проходил ли уже этот пользователь
+    # 2. Защита от повторного прохождения
     if Response.query.filter_by(survey_id=survey.id, user_id=user_id).first():
         return jsonify({'error': 'You have already responded to this survey'}), 400
     
@@ -260,44 +306,53 @@ def submit_response(survey_id):
     if not answers_data:
         return jsonify({'error': 'No answers provided'}), 400
     
+    # 3. Валидация: все обязательные вопросы должны быть отвечены
+    question_ids = {q.id for q in survey.questions}
+    answered_ids = {a.get('question_id') for a in answers_data if a.get('question_id')}
+    
+    if question_ids != answered_ids:
+        missing = question_ids - answered_ids
+        return jsonify({'error': f'Missing answers for questions: {list(missing)}'}), 400
+    
     # Создаём запись о прохождении
     response = Response(survey_id=survey.id, user_id=user_id)
     db.session.add(response)
-    db.session.flush()  # Получаем ID response
+    db.session.flush()
     
-    # Обрабатываем каждый ответ
+    # 4. Обработка и валидация каждого ответа
     for ans_data in answers_data:
         question_id = ans_data.get('question_id')
-        if not question_id:
-            continue
-        
         question = Question.query.get(question_id)
-        if not question or question.survey_id != survey.id:
-            continue  # Пропускаем неверные вопросы
         
-        answer = Answer(
-            response_id=response.id,
-            question_id=question.id
-        )
+        if not question or question.survey_id != survey.id:
+            return jsonify({'error': f'Invalid question_id: {question_id}'}), 400
+        
+        answer = Answer(response_id=response.id, question_id=question.id)
         
         if question.q_type == QuestionType.TEXT:
-            # Текстовый ответ
-            answer.text_value = ans_data.get('value', '').strip()
-        else:
-            # Ответ с выбором (сохраняем ID варианта)
+            # Текстовый ответ: проверка на пустоту
+            text_val = ans_data.get('value', '').strip()
+            if not text_val:
+                return jsonify({'error': f'Text answer required for question {question_id}'}), 400
+            answer.text_value = text_val
+            
+        elif question.q_type in [QuestionType.SINGLE, QuestionType.MULTIPLE]:
+            # Выбор варианта: проверка существования option_id
             option_id = ans_data.get('option_id')
-            if option_id:
-                # Валидация: вариант должен принадлежать этому вопросу
-                option = Option.query.get(option_id)
-                if option and option.question_id == question.id:
-                    answer.option_id = option_id
+            if not option_id:
+                return jsonify({'error': f'Option required for question {question_id}'}), 400
+            
+            option = Option.query.get(option_id)
+            if not option or option.question_id != question.id:
+                return jsonify({'error': f'Invalid option_id for question {question_id}'}), 400
+            answer.option_id = option_id
+        else:
+            return jsonify({'error': f'Unknown question type: {question.q_type}'}), 400
         
         db.session.add(answer)
     
     db.session.commit()
-    
     return jsonify({'message': 'Response submitted', 'response_id': response.id}), 201
-
 
 @surveys_bp.route('/<int:survey_id>/results', methods=['GET'])
 @jwt_required()
