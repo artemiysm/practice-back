@@ -25,7 +25,7 @@ class Survey(db.Model):
     status = db.Column(
         SQLAlchemyEnum(
             SurveyStatus, 
-            name='survey_status', 
+            name='survey_status',
             create_type=False,
             values_callable=lambda obj: [e.value for e in obj]
         ), 
